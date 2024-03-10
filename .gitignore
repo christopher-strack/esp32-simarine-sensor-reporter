@@ -1,0 +1,6 @@
+.cache
+build
+sdkconfig
+sdkconfig.old
+
+main/Config.hpp

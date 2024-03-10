@@ -1,0 +1,4 @@
+{
+    "idf.adapterTargetName": "esp32",
+    "clangd.path": "${config:idf.toolsPath}/tools/esp-clang/16.0.1-fe4f10a809/esp-clang/bin/clangd"
+}
