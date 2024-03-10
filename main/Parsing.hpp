@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <iosfwd>
 #include <optional>
 #include <span>
@@ -63,15 +64,63 @@ uint16_t crc(const std::span<const uint8_t> bytes);
 std::optional<Message>
 parseResponse(const std::span<const uint8_t> rawResponse);
 
-struct ValueMap {
-  std::unordered_map<uint8_t, std::string_view> strings;
-  std::unordered_map<uint8_t, int32_t> numbers;
+struct Number {
+  std::span<const uint8_t, 4> bytes;
+
+  double toCharge() { return secondWord() / 16000.0f; }
+  double toCurrent() { return firstWord() / 100.0f; }
+  double toVoltage() { return firstWord() / 1000.0f; }
+
+  int16_t firstWord() const { return (bytes[2] << 8) | bytes[3]; }
+  int16_t secondWord() const { return (bytes[0] << 8) | bytes[1]; }
 };
 
-/* Converts bytes received by a Simarine devices to a ValueMap.
-   Raises ParsingError in case the given bytes do not contain a valid
-   ValueMap.
-*/
-void parseValueMap(std::span<const uint8_t> bytes, ValueMap &valueMap);
+namespace detail {
+template <typename NumberFunction, typename StringFunction>
+std::span<const uint8_t> parseValue(const std::span<const uint8_t> bytes,
+                                    NumberFunction numberFunction,
+                                    StringFunction stringFunction) {
+  if (bytes.size() < 2) {
+    return {};
+  }
+
+  const auto id = bytes[0];
+  const auto type = bytes[1];
+  if (type == 1) {
+    // TODO check for range
+    numberFunction(id, Number{bytes.subspan<2, 4>()});
+    return bytes.subspan(7);
+  } else if (type == 3) {
+    // TODO check for range
+    numberFunction(id, Number{bytes.subspan<7, 4>()});
+    return bytes.subspan(12);
+  } else if (type == 4) {
+    const auto data = bytes.subspan(7);
+    const auto it = std::find(data.begin(), data.end(), uint8_t{0});
+    if (it != data.end()) {
+      const auto pos = std::distance(data.begin(), it);
+
+      // It looks like a custom encoding is used for strings. Special
+      // characters will unfortunately not works as expected.
+      const auto str =
+          std::string_view{reinterpret_cast<const char *>(data.data()),
+                           static_cast<std::string_view::size_type>(pos)};
+      stringFunction(id, str);
+
+      return bytes.subspan(7 + pos + 2);
+    }
+  }
+
+  return {};
+}
+} // namespace detail
+
+template <typename NumberFunction, typename StringFunction>
+void parseValues(std::span<const uint8_t> bytes, NumberFunction numberFunction,
+                 StringFunction stringFunction) {
+  while (!bytes.empty()) {
+    bytes = detail::parseValue(bytes, numberFunction, stringFunction);
+  }
+}
 
 } // namespace spymarine

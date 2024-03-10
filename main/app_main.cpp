@@ -12,6 +12,7 @@
 #include "esp_wifi.h"
 #include "nvs_flash.h"
 #include "protocol_examples_common.h"
+#include <cstdint>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -35,6 +36,8 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <functional>
+#include <thread>
 #include <vector>
 
 static const char *TAG = "mqtts_example";
@@ -99,27 +102,96 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
 
 namespace {
 
-int16_t firstWord(uint32_t value) {
-  return static_cast<int16_t>(value & 0xFFFF);
+std::span<char>
+writeSensorValuesJson(const std::span<char> buffer,
+                      const std::unordered_map<uint8_t, double> &values) {
+  size_t totalLength = 0;
+  auto writeBuffer = buffer;
+
+  const auto writeChar = [&](char c) {
+    if (writeBuffer.size() > 0) {
+      writeBuffer[0] = c;
+      writeBuffer = writeBuffer.subspan(1);
+      totalLength++;
+    }
+  };
+
+  writeChar('[');
+  size_t i = 0;
+  for (const auto &value : values) {
+    const auto length = std::snprintf(writeBuffer.data(), writeBuffer.size(),
+                                      R"({"sensor_id":%d,"value":%g})",
+                                      value.first, value.second);
+    writeBuffer = writeBuffer.subspan(length);
+    totalLength += length;
+
+    if (i < values.size() - 1) {
+      writeChar(',');
+    }
+
+    i++;
+  }
+  writeChar(']');
+  writeChar('\0');
+
+  return buffer.subspan(0, totalLength);
 }
 
-int16_t secondWord(uint32_t value) {
-  return static_cast<int16_t>((value >> 16) & 0xFFFF);
+enum class SensorType {
+  charge,
+  current,
+  voltage,
+};
+
+double sensorValue(SensorType type, spymarine::Number number) {
+  switch (type) {
+  case SensorType::charge:
+    return number.toCharge();
+  case SensorType::current:
+    return number.toCurrent();
+  case SensorType::voltage:
+    return number.toVoltage();
+  }
+  return 0;
 }
 
-double toCharge(uint32_t value) { return secondWord(value) / 16000.0f; }
+class MovingAverageSensorReporter {
+public:
+  explicit MovingAverageSensorReporter(
+      std::unordered_map<uint8_t, SensorType> definitions)
+      : mDefinitions(std::move(definitions)) {}
 
-double toCurrent(uint32_t value) { return firstWord(value) / 100.0f; }
+  void updateValue(uint8_t id, const spymarine::Number number) {
+    const auto it = mDefinitions.find(id);
+    if (it != mDefinitions.end()) {
+      const auto [counter, value] = mCumulativeValues[id];
+      mCumulativeValues[id] = {counter + 1,
+                               value + sensorValue(it->second, number)};
+    }
+  }
 
-double toVoltage(uint32_t value) { return value / 1000.0f; }
+  const std::unordered_map<uint8_t, double> &createMovingAverage() {
+    for (auto &entry : mCumulativeValues) {
+      const auto [counter, value] = entry.second;
+      mAverageValues[entry.first] = value / counter;
+      entry.second = {0, 0.0};
+    }
+    return mAverageValues;
+  }
+
+private:
+  std::unordered_map<uint8_t, SensorType> mDefinitions;
+  std::unordered_map<uint8_t, std::pair<size_t, double>> mCumulativeValues;
+  std::unordered_map<uint8_t, double> mAverageValues;
+};
 
 void processSensorValues(esp_mqtt_client_handle_t mqttClient) {
-  const auto kDefeaultSimarineUdpPort = 43210;
+  const auto kDefaultSimarineUdpPort = 43210;
 
   UdpBroadcastServer server;
 
-  while (!server.bind(kDefeaultSimarineUdpPort)) {
-    vTaskDelay(5 / portTICK_PERIOD_MS);
+  while (!server.bind(kDefaultSimarineUdpPort)) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{5});
   }
 
   std::vector<uint8_t> recvbuf;
@@ -128,53 +200,38 @@ void processSensorValues(esp_mqtt_client_handle_t mqttClient) {
   std::vector<char> jsonBuffer;
   jsonBuffer.resize(1024);
 
-  spymarine::ValueMap valueMap;
-  std::unordered_map<uint8_t, double> cumulativeValues;
-  cumulativeValues[26] = 0;
-  cumulativeValues[27] = 0;
-  cumulativeValues[33] = 0;
-  cumulativeValues[35] = 0;
-  size_t counter = 0;
+  MovingAverageSensorReporter sensorReporter{{
+      // Bulltron
+      {26, SensorType::charge},
+      {27, SensorType::current},
+      // Starter
+      {33, SensorType::charge},
+      {35, SensorType::voltage},
+  }};
+
   auto start = std::chrono::steady_clock::now();
 
   while (true) {
     if (const auto buffer = server.receive(recvbuf)) {
-      if (const auto message = spymarine::parseResponse(*buffer)) {
-        spymarine::parseValueMap(message->data, valueMap);
-
-        cumulativeValues[26] += toCharge(valueMap.numbers[26]);
-        cumulativeValues[27] += toCurrent(valueMap.numbers[27]);
-        cumulativeValues[33] += toCharge(valueMap.numbers[33]);
-        cumulativeValues[35] += toVoltage(valueMap.numbers[35]);
-        counter++;
+      if (const auto message = spymarine::parseResponse(*buffer);
+          message && message->type == spymarine::MessageType::sensorState) {
+        spymarine::parseValues(
+            message->data,
+            [&](const uint8_t id, const spymarine::Number number) {
+              sensorReporter.updateValue(id, number);
+            },
+            [](const uint8_t, const std::string_view) {});
 
         const auto delta = std::chrono::steady_clock::now() - start;
 
-        if (delta >= std::chrono::minutes{1}) {
-          cumulativeValues[26] /= counter;
-          cumulativeValues[27] /= counter;
-          cumulativeValues[33] /= counter;
-          cumulativeValues[35] /= counter;
+        if (delta >= std::chrono::seconds{5}) {
+          const auto json = writeSensorValuesJson(
+              jsonBuffer, sensorReporter.createMovingAverage());
 
-          ESP_LOGI(TAG, "Bulltron Charge %f", cumulativeValues[26]);
-          ESP_LOGI(TAG, "Bulltron Current %f", cumulativeValues[27]);
-          ESP_LOGI(TAG, "Starter Charge %f", cumulativeValues[33]);
-          ESP_LOGI(TAG, "Starter Voltage %f", cumulativeValues[35]);
+          esp_mqtt_client_publish(mqttClient, "/sensors_test/all", json.data(),
+                                  json.size(), 0, 0);
+          ESP_LOGI(TAG, "sent publish successful, json=%s", json.data());
 
-          const auto length = std::snprintf(
-              jsonBuffer.data(), jsonBuffer.size(),
-              R"([{"sensor_id":26,"value":%f},{"sensor_id":27,"value":%f},{"sensor_id":33,"value":%f},{"sensor_id":35,"value":%f}])",
-              cumulativeValues[26], cumulativeValues[27], cumulativeValues[33],
-              cumulativeValues[35]);
-          const auto msgId = esp_mqtt_client_publish(
-              mqttClient, "/sensors/all", jsonBuffer.data(), length, 0, 0);
-          ESP_LOGI(TAG, "sent publish successful, msg_id=%d", msgId);
-
-          cumulativeValues[26] = 0;
-          cumulativeValues[27] = 0;
-          cumulativeValues[33] = 0;
-          cumulativeValues[35] = 0;
-          counter = 0;
           start = std::chrono::steady_clock::now();
         }
       }
