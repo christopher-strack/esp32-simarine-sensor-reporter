@@ -28,8 +28,9 @@
 #include "lwip/sockets.h"
 
 #include "esp_log.h"
-#include "mqtt_client.h"
 
+#include "JsonWriter.hpp"
+#include "MqttClient.hpp"
 #include "Parsing.hpp"
 #include "UdpBroadcastServer.hpp"
 
@@ -42,99 +43,29 @@
 
 static const char *TAG = "mqtts_example";
 
-extern const uint8_t client_cert_pem_start[] asm("_binary_client_crt_start");
-extern const uint8_t client_cert_pem_end[] asm("_binary_client_crt_end");
-extern const uint8_t client_key_pem_start[] asm("_binary_client_key_start");
-extern const uint8_t client_key_pem_end[] asm("_binary_client_key_end");
-extern const uint8_t
-    server_cert_pem_start[] asm("_binary_mosquitto_org_crt_start");
-extern const uint8_t server_cert_pem_end[] asm("_binary_mosquitto_org_crt_end");
-
-static void log_error_if_nonzero(const char *message, int error_code) {
-  if (error_code != 0) {
-    ESP_LOGE(TAG, "Last error %s: 0x%x", message, error_code);
-  }
-}
-
-static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
-                               int32_t event_id, void *event_data) {
-  ESP_LOGD(TAG, "Event dispatched from event loop base=%s, event_id=%" PRIi32,
-           base, event_id);
-  esp_mqtt_event_handle_t event =
-      reinterpret_cast<esp_mqtt_event_handle_t>(event_data);
-  switch (static_cast<esp_mqtt_event_id_t>(event_id)) {
-  case MQTT_EVENT_CONNECTED:
-    ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
-    break;
-  case MQTT_EVENT_DISCONNECTED:
-    ESP_LOGI(TAG, "MQTT_EVENT_DISCONNECTED");
-    break;
-  case MQTT_EVENT_SUBSCRIBED:
-    ESP_LOGI(TAG, "MQTT_EVENT_SUBSCRIBED, msg_id=%d", event->msg_id);
-    break;
-  case MQTT_EVENT_UNSUBSCRIBED:
-    ESP_LOGI(TAG, "MQTT_EVENT_UNSUBSCRIBED, msg_id=%d", event->msg_id);
-    break;
-  case MQTT_EVENT_PUBLISHED:
-    ESP_LOGI(TAG, "MQTT_EVENT_PUBLISHED, msg_id=%d", event->msg_id);
-    break;
-  case MQTT_EVENT_DATA:
-    ESP_LOGI(TAG, "MQTT_EVENT_DATA");
-    break;
-  case MQTT_EVENT_ERROR:
-    ESP_LOGI(TAG, "MQTT_EVENT_ERROR");
-    if (event->error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT) {
-      log_error_if_nonzero("reported from esp-tls",
-                           event->error_handle->esp_tls_last_esp_err);
-      log_error_if_nonzero("reported from tls stack",
-                           event->error_handle->esp_tls_stack_err);
-      log_error_if_nonzero("captured as transport's socket errno",
-                           event->error_handle->esp_transport_sock_errno);
-      ESP_LOGI(TAG, "Last errno string (%s)",
-               strerror(event->error_handle->esp_transport_sock_errno));
-    }
-    break;
-  default:
-    ESP_LOGI(TAG, "Other event id:%d", event->event_id);
-    break;
-  }
-}
-
 namespace {
 
-std::span<char>
+std::string_view
 writeSensorValuesJson(const std::span<char> buffer,
                       const std::unordered_map<uint8_t, double> &values) {
-  size_t totalLength = 0;
-  auto writeBuffer = buffer;
+  JsonWriter writer{buffer};
 
-  const auto writeChar = [&](char c) {
-    if (writeBuffer.size() > 0) {
-      writeBuffer[0] = c;
-      writeBuffer = writeBuffer.subspan(1);
-      totalLength++;
-    }
-  };
-
-  writeChar('[');
+  writer.writeChar('[');
   size_t i = 0;
   for (const auto &value : values) {
-    const auto length = std::snprintf(writeBuffer.data(), writeBuffer.size(),
-                                      R"({"sensor_id":%d,"value":%g})",
-                                      value.first, value.second);
-    writeBuffer = writeBuffer.subspan(length);
-    totalLength += length;
+    writer.writeString(R"({"sensor_id":%d,"value":%g})", value.first,
+                       value.second);
 
     if (i < values.size() - 1) {
-      writeChar(',');
+      writer.writeChar(',');
     }
 
     i++;
   }
-  writeChar(']');
-  writeChar('\0');
+  writer.writeChar(']');
+  writer.writeChar('\0');
 
-  return buffer.subspan(0, totalLength);
+  return writer.toString();
 }
 
 enum class SensorType {
@@ -185,32 +116,23 @@ private:
   std::unordered_map<uint8_t, double> mAverageValues;
 };
 
-void processSensorValues(esp_mqtt_client_handle_t mqttClient) {
-  const auto kDefaultSimarineUdpPort = 43210;
-
+template <typename SensorFunction>
+void readSensorValues(
+    std::unordered_map<uint8_t, SensorType> sensorDefinitions, size_t udpPort,
+    SensorFunction function,
+    std::chrono::steady_clock::duration movingAverageInterval) {
   UdpBroadcastServer server;
 
-  while (!server.bind(kDefaultSimarineUdpPort)) {
+  while (!server.bind(udpPort)) {
     std::this_thread::sleep_for(std::chrono::milliseconds{5});
   }
 
   std::vector<uint8_t> recvbuf;
   recvbuf.resize(1024);
 
-  std::vector<char> jsonBuffer;
-  jsonBuffer.resize(1024);
-
-  MovingAverageSensorReporter sensorReporter{{
-      // Bulltron
-      {26, SensorType::charge},
-      {27, SensorType::current},
-      // Starter
-      {33, SensorType::charge},
-      {35, SensorType::voltage},
-  }};
+  MovingAverageSensorReporter sensorReporter{std::move(sensorDefinitions)};
 
   auto start = std::chrono::steady_clock::now();
-
   while (true) {
     if (const auto buffer = server.receive(recvbuf)) {
       if (const auto message = spymarine::parseResponse(*buffer);
@@ -223,15 +145,8 @@ void processSensorValues(esp_mqtt_client_handle_t mqttClient) {
             [](const uint8_t, const std::string_view) {});
 
         const auto delta = std::chrono::steady_clock::now() - start;
-
-        if (delta >= std::chrono::seconds{5}) {
-          const auto json = writeSensorValuesJson(
-              jsonBuffer, sensorReporter.createMovingAverage());
-
-          esp_mqtt_client_publish(mqttClient, "/sensors_test/all", json.data(),
-                                  json.size(), 0, 0);
-          ESP_LOGI(TAG, "sent publish successful, json=%s", json.data());
-
+        if (delta >= movingAverageInterval) {
+          function(sensorReporter.createMovingAverage());
           start = std::chrono::steady_clock::now();
         }
       }
@@ -241,30 +156,29 @@ void processSensorValues(esp_mqtt_client_handle_t mqttClient) {
 
 } // namespace
 
-static void mqtt_app_start(void) {
-  esp_mqtt_client_config_t mqtt_cfg;
-  std::memset(&mqtt_cfg, 0, sizeof(esp_mqtt_client_config_t));
+static void start(void) {
+  const auto kDefaultSimarineUdpPort = 43210;
 
-  mqtt_cfg.broker.address.uri =
-      "mqtts://a2cn68t41migo6-ats.iot.eu-central-1.amazonaws.com:8883";
+  MqttClient client;
 
-  mqtt_cfg.broker.verification.certificate =
-      (const char *)server_cert_pem_start;
-  mqtt_cfg.credentials.authentication.certificate =
-      (const char *)client_cert_pem_start;
-  mqtt_cfg.credentials.authentication.key = (const char *)client_key_pem_start;
+  std::vector<char> jsonBuffer;
+  jsonBuffer.resize(1024);
 
-  ESP_LOGI(TAG, "[APP] Free memory: %" PRIu32 " bytes",
-           esp_get_free_heap_size());
-  esp_mqtt_client_handle_t client = esp_mqtt_client_init(&mqtt_cfg);
-
-  esp_mqtt_client_register_event(
-      client, static_cast<esp_mqtt_event_id_t>(ESP_EVENT_ANY_ID),
-      mqtt_event_handler, NULL);
-
-  esp_mqtt_client_start(client);
-
-  processSensorValues(client);
+  readSensorValues(
+      {
+          // Bulltron
+          {26, SensorType::charge},
+          {27, SensorType::current},
+          // Starter
+          {33, SensorType::charge},
+          {35, SensorType::voltage},
+      },
+      kDefaultSimarineUdpPort,
+      [&](const std::unordered_map<uint8_t, double> &sensorValues) {
+        const auto json = writeSensorValuesJson(jsonBuffer, sensorValues);
+        client.publish("/sensors/all", json.data());
+      },
+      std::chrono::seconds{5});
 }
 
 extern "C" void app_main(void) {
@@ -289,5 +203,5 @@ extern "C" void app_main(void) {
    */
   ESP_ERROR_CHECK(example_connect());
 
-  mqtt_app_start();
+  start();
 }
